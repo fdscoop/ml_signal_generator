@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 
-
 # Standard library imports
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -24,12 +23,11 @@ logger = logging.getLogger(__name__)
 
 def convert_to_serializable(obj):
     """Convert NumPy types to Python native types"""
-    if isinstance(obj, (np.int_, np.intc, np.intp, np.int8, np.int16, np.int32,
-        np.int64, np.uint8, np.uint16, np.uint32, np.uint64)):
+    if isinstance(obj, (np.int8, np.int16, np.int32, np.int64, np.uint8, np.uint16, np.uint32, np.uint64)):
         return int(obj)
-    elif isinstance(obj, (np.float_, np.float16, np.float32, np.float64)):
+    elif isinstance(obj, (np.float16, np.float32, np.float64)):
         return float(obj)
-    elif isinstance(obj, (np.bool_)):
+    elif isinstance(obj, np.bool_):
         return bool(obj)
     elif isinstance(obj, np.ndarray):
         return obj.tolist()
@@ -38,6 +36,7 @@ def convert_to_serializable(obj):
     elif isinstance(obj, list):
         return [convert_to_serializable(item) for item in obj]
     return obj
+
 
 def parse_symbol(symbol: str) -> Dict:
     """
