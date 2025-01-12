@@ -1336,17 +1336,6 @@ def welcome():
         "status": "active"
     })
 
-# Flask routes and utility functions
-
-# Update the Flask route to handle both payload types
-@app.route('/')
-def welcome():
-    """Welcome page route"""
-    return jsonify({
-        "message": "Welcome to Enhanced Options Analytics Platform",
-        "version": "2.0.0",
-        "status": "active"
-    })
 
 @app.route('/analyze', methods=['POST', 'OPTIONS'])
 def analyze_instrument():
