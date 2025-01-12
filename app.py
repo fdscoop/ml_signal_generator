@@ -14,7 +14,6 @@ from flask_cors import CORS
 import numpy as np
 import pandas as pd
 from scipy.stats import norm, stats
-import pyngrok.ngrok as ngrok
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -1506,8 +1505,15 @@ def main():
             pass
 
 if __name__ == '__main__':
-    # Get port from environment variable (Heroku will set this)
-    port = int(os.environ.get('PORT', 5000))
-    
-    # Start Flask app
-    app.run(host='0.0.0.0', port=port)
+    try:
+        # Get port from environment variable (Heroku will set this)
+        port = int(os.environ.get('PORT', 5000))
+        
+        # Log startup
+        logger.info(f"Starting server on port {port}")
+        
+        # Start Flask app
+        app.run(host='0.0.0.0', port=port)
+        
+    except Exception as e:
+        logger.error(f"Startup error: {str(e)}")
