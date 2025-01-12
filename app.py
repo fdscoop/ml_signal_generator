@@ -21,19 +21,40 @@ logger = logging.getLogger(__name__)
 
 def convert_to_serializable(obj):
     """Convert NumPy types to Python native types"""
-    if isinstance(obj, (np.int_, np.intc, np.intp, np.int8, np.int16, np.int32,
-        np.int64, np.uint8, np.uint16, np.uint32, np.uint64)):
+    # Handle None/null values
+    if obj is None:
+        return None
+        
+    # Updated NumPy integer types
+    if isinstance(obj, (np.int64, np.int32, np.int16, np.int8,
+                       np.uint64, np.uint32, np.uint16, np.uint8)):
         return int(obj)
-    elif isinstance(obj, (np.float_, np.float16, np.float32, np.float64)):
+        
+    # Updated NumPy float types
+    if isinstance(obj, (np.float64, np.float32, np.float16)):
         return float(obj)
-    elif isinstance(obj, (np.bool_)):
+        
+    # NumPy boolean
+    if isinstance(obj, np.bool_):
         return bool(obj)
-    elif isinstance(obj, np.ndarray):
+        
+    # NumPy array
+    if isinstance(obj, np.ndarray):
         return obj.tolist()
-    elif isinstance(obj, dict):
+        
+    # Handle datetime
+    if isinstance(obj, np.datetime64):
+        return str(obj)
+        
+    # Recursive handling for dictionaries
+    if isinstance(obj, dict):
         return {key: convert_to_serializable(value) for key, value in obj.items()}
-    elif isinstance(obj, list):
+        
+    # Recursive handling for lists/tuples
+    if isinstance(obj, (list, tuple)):
         return [convert_to_serializable(item) for item in obj]
+        
+    # Return unchanged if no conversion needed
     return obj
 
 def parse_option_symbol(symbol: str) -> Dict:
