@@ -2,43 +2,163 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
+from functools import wraps, lru_cache
 import logging
 import warnings
 import os
 import time
+import statistics
+from time import perf_counter
 
 # Third-party imports
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_compress import Compress
 import numpy as np
 import pandas as pd
 from scipy.stats import norm, stats
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+import structlog
+from dataclasses import dataclass, field
+from typing import Dict
+
+@dataclass
+class Config:
+    """Global configuration settings"""
+    RISK_FREE_RATE: float = 0.05
+    MIN_PREMIUM: float = 5.0
+    MAX_RISK_PERCENT: float = 0.30
+    DEFAULT_VOLATILITY: float = 0.30
+    LOOKBACK_PERIODS: Dict[str, int] = field(default_factory=lambda: {
+        'SHORT': 20,
+        'MEDIUM': 50,
+        'LONG': 200
+    })
+    
+    # Error thresholds
+    MIN_VOLUME: int = 100
+    MIN_OPEN_INTEREST: int = 50
+    
+    # Risk management
+    DEFAULT_ACCOUNT_SIZE: float = 100000
+    MAX_RISK_PER_TRADE: float = 0.02
+
+config = Config()
+
+# Custom Exceptions
+class OptionsAnalysisError(Exception):
+    """Base exception for options analysis errors"""
+    pass
+
+class DataValidationError(OptionsAnalysisError):
+    """Raised when data validation fails"""
+    pass
+
+class CalculationError(OptionsAnalysisError):
+    """Raised when calculations fail"""
+    pass
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
+
+def log_analysis_event(event_type: str,
+                      data: Dict[str, Any],
+                      error: Exception = None) -> None:
+    """Log analysis events with structured data"""
+    log_data = {
+        'event_type': event_type,
+        'timestamp': datetime.now().isoformat(),
+        'data': data
+    }
+    
+    if error:
+        log_data.update({
+            'error_type': type(error).__name__,
+            'error_message': str(error)
+        })
+        
+    logger.error('analysis_event', **log_data) if error else \
+    logger.info('analysis_event', **log_data)
+
+class PerformanceMonitor:
+    """Monitor analysis performance"""
+    
+    def __init__(self):
+        self.execution_times = []
+        
+    def track_execution(self, func):
+        """Decorator to track function execution time"""
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            start_time = perf_counter()
+            result = func(*args, **kwargs)
+            execution_time = perf_counter() - start_time
+            
+            self.execution_times.append(execution_time)
+            
+            self.log_performance_metrics()
+            return result
+        return wrapper
+        
+    def log_performance_metrics(self):
+        """Log performance metrics"""
+        if len(self.execution_times) > 1:
+            metrics = {
+                'avg_execution_time': statistics.mean(self.execution_times),
+                'std_execution_time': statistics.stdev(self.execution_times),
+                'max_execution_time': max(self.execution_times),
+                'min_execution_time': min(self.execution_times)
+            }
+            logger.info('performance_metrics', **metrics)
+
+performance_monitor = PerformanceMonitor()
+
+def handle_analysis_error(func):
+    """Decorator for handling analysis errors"""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except OptionsAnalysisError as e:
+            logger.error(f"Analysis error in {func.__name__}: {str(e)}")
+            return {
+                'status': 'error',
+                'error_type': e.__class__.__name__,
+                'message': str(e)
+            }
+        except Exception as e:
+            logger.exception(f"Unexpected error in {func.__name__}")
+            return {
+                'status': 'error',
+                'error_type': 'UnexpectedError',
+                'message': str(e)
+            }
+    return wrapper
 
 def convert_to_serializable(obj):
     """Convert NumPy types to Python native types"""
-    # Handle None/null values
     if obj is None:
         return None
         
-    # Updated NumPy integer types
+    # Handle NumPy integer types
     if isinstance(obj, (np.int64, np.int32, np.int16, np.int8,
                        np.uint64, np.uint32, np.uint16, np.uint8)):
         return int(obj)
         
-    # Updated NumPy float types
+    # Handle NumPy float types
     if isinstance(obj, (np.float64, np.float32, np.float16)):
         return float(obj)
         
-    # NumPy boolean
+    # Handle NumPy boolean
     if isinstance(obj, np.bool_):
         return bool(obj)
         
-    # NumPy array
+    # Handle NumPy array
     if isinstance(obj, np.ndarray):
         return obj.tolist()
         
@@ -46,16 +166,62 @@ def convert_to_serializable(obj):
     if isinstance(obj, np.datetime64):
         return str(obj)
         
-    # Recursive handling for dictionaries
+    # Handle dictionaries
     if isinstance(obj, dict):
         return {key: convert_to_serializable(value) for key, value in obj.items()}
         
-    # Recursive handling for lists/tuples
+    # Handle lists/tuples
     if isinstance(obj, (list, tuple)):
         return [convert_to_serializable(item) for item in obj]
         
-    # Return unchanged if no conversion needed
     return obj
+
+class DataValidator:
+    """Enhanced data validation for options analysis"""
+    
+    @staticmethod
+    def validate_price_data(df: pd.DataFrame) -> bool:
+        """Validate price data completeness and quality"""
+        required_columns = {'open', 'high', 'low', 'close', 'volume'}
+        
+        if not all(col in df.columns for col in required_columns):
+            raise DataValidationError("Missing required price columns")
+            
+        # Check for missing values
+        if df[list(required_columns)].isna().any().any():
+            raise DataValidationError("Price data contains missing values")
+            
+        # Check for invalid values
+        if (df[['open', 'high', 'low', 'close']] <= 0).any().any():
+            raise DataValidationError("Invalid price values detected")
+            
+        # Check data frequency
+        time_diff = df.index.to_series().diff().median()
+        if time_diff.total_seconds() > 86400:  # More than 1 day
+            raise DataValidationError("Data frequency too low")
+            
+        return True
+
+    @staticmethod
+    def validate_option_chain(chain: pd.DataFrame) -> bool:
+        """Validate option chain data"""
+        required_columns = {
+            'strike', 'expiry', 'option_type', 
+            'bid', 'ask', 'volume', 'open_interest'
+        }
+        
+        if not all(col in chain.columns for col in required_columns):
+            raise DataValidationError("Missing required option chain columns")
+            
+        # Validate option types
+        if not chain['option_type'].isin(['call', 'put']).all():
+            raise DataValidationError("Invalid option types detected")
+            
+        # Validate strikes
+        if (chain['strike'] <= 0).any():
+            raise DataValidationError("Invalid strike prices detected")
+            
+        return True
 
 def parse_option_symbol(symbol: str) -> Dict:
     """
@@ -145,10 +311,58 @@ def calculate_historical_volatility(prices: pd.Series, window: int = 20) -> floa
         logger.error(f"Error calculating historical volatility: {str(e)}")
         return 0.3  # Return default 30% volatility if calculation fails
 
+# [Continue in next message due to length...]
+    
+# Continue from previous part...
 
-# Initialize Flask app
-app = Flask(__name__)
-CORS(app)
+class CachedCalculator:
+    """Calculator with caching for expensive operations"""
+    
+    @lru_cache(maxsize=128)
+    def calculate_historical_volatility(self, 
+                                     price_tuple: tuple,
+                                     window: int = 20) -> float:
+        """Cached volatility calculation"""
+        prices = pd.Series(price_tuple)
+        returns = np.log(prices / prices.shift(1))
+        return float(returns.std() * np.sqrt(252))
+    
+    @lru_cache(maxsize=128)
+    def calculate_greeks(self,
+                        S: float,
+                        K: float,
+                        T: float,
+                        r: float,
+                        sigma: float,
+                        option_type: str) -> Dict:
+        """Cached Greeks calculation"""
+        try:
+            # Calculate d1 and d2
+            d1 = (np.log(S/K) + (r + sigma**2/2)*T) / (sigma*np.sqrt(T))
+            d2 = d1 - sigma*np.sqrt(T)
+
+            # Adjust for put options
+            sign = 1 if option_type.lower() == 'call' else -1
+
+            # Calculate Greeks
+            delta = sign * norm.cdf(sign * d1)
+            gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
+            theta = (-S * sigma * norm.pdf(d1)) / (2 * np.sqrt(T)) - \
+                   sign * r * K * np.exp(-r*T) * norm.cdf(sign * d2)
+            vega = S * np.sqrt(T) * norm.pdf(d1)
+            rho = sign * K * T * np.exp(-r*T) * norm.cdf(sign * d2)
+
+            return {
+                'delta': float(delta),
+                'gamma': float(gamma),
+                'theta': float(theta/365),  # Daily theta
+                'vega': float(vega/100),    # 1% volatility change
+                'rho': float(rho/100)       # 1% rate change
+            }
+
+        except Exception as e:
+            logger.error(f"Error calculating Greeks: {str(e)}")
+            return None
 
 @dataclass
 class MarketContext:
@@ -247,10 +461,46 @@ class TechnicalIndicators:
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         return tr.rolling(window=window).mean()
 
+class MLRegimeDetector:
+    """Machine learning based market regime detection"""
+    
+    def __init__(self):
+        self.model = RandomForestClassifier(n_estimators=100)
+        self.scaler = StandardScaler()
+        
+    def prepare_features(self, context: MarketContext) -> np.ndarray:
+        """Prepare features for regime detection"""
+        df = context.index_history
+        
+        features = pd.DataFrame({
+            'returns': df['close'].pct_change(),
+            'volatility': df['close'].pct_change().rolling(20).std(),
+            'volume_ratio': df['volume'] / df['volume'].rolling(20).mean(),
+            'rsi': TechnicalIndicators.calculate_rsi(df['close']),
+            'bb_width': TechnicalIndicators.calculate_bollinger_bands(
+                df['close'])['bandwidth']
+        }).dropna()
+        
+        return self.scaler.fit_transform(features)
+    
+    def detect_regime(self, context: MarketContext) -> str:
+        """Detect market regime using ML"""
+        features = self.prepare_features(context)
+        prediction = self.model.predict(features[-1:])
+        return self._map_regime(prediction[0])
+    
+    def _map_regime(self, prediction: int) -> str:
+        """Map numerical prediction to regime type"""
+        regime_map = {
+            0: 'LOW_VOLATILITY',
+            1: 'HIGH_VOLATILITY',
+            2: 'TRENDING',
+            3: 'MEAN_REVERTING'
+        }
+        return regime_map.get(prediction, 'UNKNOWN')
 
-"""
-Options Analysis Server with Enhanced Analysis and Ngrok Integration - Part 2: Market Regime Detector
-"""
+# [Continue in next message...]
+# Continue from previous part...
 
 class MarketRegimeDetector:
     """Enhanced market regime detection"""
@@ -279,7 +529,7 @@ class MarketRegimeDetector:
             # Detect momentum
             momentum = self.detect_momentum(index_indicators, option_indicators)
 
-            # Analyze OI patterns - use the class method instead of undefined reference
+            # Analyze OI patterns
             oi_analysis = self.analyze_oi_patterns_regime(context.oi_history)
 
             return {
@@ -453,7 +703,6 @@ class MarketRegimeDetector:
             logger.error(f"Error analyzing OI patterns: {str(e)}")
             return {'trend': 'ERROR', 'error': str(e)}
 
-
     def classify_regime(self, trend: Dict, volatility: Dict,
                        momentum: Dict, oi_analysis: Dict) -> Dict:
         """Classify market regime"""
@@ -503,6 +752,9 @@ class MarketRegimeDetector:
             logger.error(f"Error classifying regime: {str(e)}")
             return None
 
+# [Continue in next message...]
+# Continue from previous part...
+
 class EnhancedOptionsAnalyzer:
     """Enhanced options analysis with market regime integration"""
 
@@ -540,6 +792,7 @@ class EnhancedOptionsAnalyzer:
             # Return empty DataFrame with required columns
             return pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
 
+    @performance_monitor.track_execution
     def analyze_instrument(self, index_data: List[List], option_data: List[List], symbol: str) -> Dict:
         """Analyze any financial instrument (index, stock, or option)"""
         try:
@@ -749,106 +1002,6 @@ class EnhancedOptionsAnalyzer:
             logger.error(f"Error in OI analysis: {str(e)}")
             return None
 
-    def calculate_risk_parameters(self, context: MarketContext, signals: Dict, instrument_info: Dict) -> Dict:
-        """Calculate risk parameters with focus on option positions using option data"""
-        try:
-            # Get regime data safely
-            regime = self.regime_detector.detect_regime(context)
-            volatility_state = regime.get('volatility', {}).get('state', 'NORMAL') if regime else 'NORMAL'
-
-            # Get current prices - use option price for options
-            if instrument_info['type'] == 'option':
-                # Use option price for entry if available
-                if not context.option_history.empty:
-                    entry_price = float(context.option_history['close'].iloc[-1])
-                else:
-                    raise ValueError("Option data required for option analysis")
-            else:
-                # Use index price for stocks/indices
-                entry_price = context.index_price
-
-            combined_score = signals.get('combined_score', 0) if signals else 0
-
-            # For options specifically
-            if instrument_info['type'] == 'option':
-                # Determine position side based on option type and market view
-                is_bearish = combined_score < 0
-                is_put = instrument_info['option_type'] == 'put'
-
-                # Option-specific calculations
-                if (is_put and is_bearish) or (not is_put and not is_bearish):
-                    # Favorable setup
-                    if volatility_state == 'HIGH':
-                        sl_percentage = 0.40  # 40% for high volatility
-                    elif volatility_state == 'LOW':
-                        sl_percentage = 0.25  # 25% for low volatility
-                    else:
-                        sl_percentage = 0.30  # 30% for normal volatility
-
-                    stop_loss = round(entry_price * (1 - sl_percentage), 2)
-                    target = round(entry_price * (1 + (sl_percentage * self.risk_reward_ratio)), 2)
-
-                    return {
-                        'entry_price': entry_price,
-                        'stop_loss': stop_loss,
-                        'target': target,
-                        'action': 'BUY',
-                        'risk_reward_ratio': self.risk_reward_ratio,
-                        'risk_per_trade': round(entry_price - stop_loss, 2),
-                        'potential_reward': round(target - entry_price, 2),
-                        'price_source': 'option',
-                        'volatility_state': volatility_state,
-                        'option_details': {
-                            'strike': instrument_info['strike'],
-                            'days_to_expiry': instrument_info['days_to_expiry'],
-                            'type': instrument_info['option_type'],
-                            'spot_price': context.index_price
-                        }
-                    }
-                else:
-                    # Unfavorable setup
-                    return {
-                        'entry_price': entry_price,
-                        'action': 'DO_NOT_TRADE',
-                        'reason': f"{'Bullish' if is_bearish else 'Bearish'} signal mismatched with {instrument_info['option_type'].upper()} option",
-                        'price_source': 'option',
-                        'volatility_state': volatility_state,
-                        'option_details': {
-                            'strike': instrument_info['strike'],
-                            'days_to_expiry': instrument_info['days_to_expiry'],
-                            'type': instrument_info['option_type'],
-                            'spot_price': context.index_price
-                        }
-                    }
-            else:
-                # For index/stock analysis
-                sl_percentage = 0.03  # 3% for stocks
-                target_percentage = sl_percentage * 1.5  # 1.5 RR ratio
-
-                stop_loss = round(entry_price * (1 + sl_percentage), 2)
-                target = round(entry_price * (1 - target_percentage), 2)
-
-                return {
-                    'entry_price': entry_price,
-                    'stop_loss': stop_loss,
-                    'target': target,
-                    'action': 'SELL' if combined_score < 0 else 'BUY',
-                    'risk_reward_ratio': 1.5,
-                    'risk_per_trade': round(abs(stop_loss - entry_price), 2),
-                    'potential_reward': round(abs(target - entry_price), 2),
-                    'price_source': 'index/stock',
-                    'volatility_state': volatility_state
-                }
-
-        except Exception as e:
-            logger.error(f"Error calculating risk parameters: {str(e)}")
-            return {
-                'entry_price': entry_price if 'entry_price' in locals() else 0.0,
-                'action': 'ERROR',
-                'error': str(e),
-                'price_source': 'option' if instrument_info['type'] == 'option' else 'index/stock'
-            }
-            
     def _calculate_signal_score(self, price_signals: Dict,
                           volume_signals: Dict,
                           oi_signals: Dict,
@@ -967,6 +1120,72 @@ class EnhancedOptionsAnalyzer:
             logger.error(f"Error calculating signal score: {str(e)}")
             return 0.0
 
+# [Continue in next message...]
+# Continue from previous part...
+        
+# Add these classes and methods to the previous implementation
+
+class ParallelAnalyzer:
+    """Parallel analysis of multiple options"""
+    
+    def __init__(self, max_workers: int = 4):
+        self.max_workers = max_workers
+        
+    def analyze_multiple_options(self, 
+                               options_data: List[Dict],
+                               market_context: MarketContext) -> List[Dict]:
+        """Analyze multiple options in parallel"""
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = [
+                executor.submit(
+                    self._analyze_single_option,
+                    option_data,
+                    market_context
+                )
+                for option_data in options_data
+            ]
+            return [future.result() for future in futures]
+            
+    def _analyze_single_option(self, 
+                             option_data: Dict,
+                             market_context: MarketContext) -> Dict:
+        """Analyze a single option"""
+        analyzer = EnhancedOptionsAnalyzer()
+        return analyzer.analyze_instrument(
+            index_data=market_context.index_history.to_dict('records'),
+            option_data=option_data,
+            symbol=option_data['symbol']
+        )
+
+class PositionSizer:
+    """Enhanced position sizing with Kelly Criterion"""
+    
+    def calculate_kelly_position(self,
+                               win_prob: float,
+                               win_loss_ratio: float,
+                               account_size: float) -> Dict:
+        """Calculate position size using Kelly Criterion"""
+        kelly_fraction = (win_prob * win_loss_ratio - (1 - win_prob)) / win_loss_ratio
+        
+        # Fractional Kelly for more conservative sizing
+        fractional_kelly = kelly_fraction * 0.5
+        
+        # Apply maximum position size constraint
+        max_position = min(
+            fractional_kelly * account_size,
+            account_size * config.MAX_RISK_PER_TRADE
+        )
+        
+        return {
+            'kelly_fraction': kelly_fraction,
+            'suggested_position': max_position,
+            'max_position': account_size * config.MAX_RISK_PER_TRADE
+        }
+
+# Add these methods to the EnhancedOptionsAnalyzer class
+class EnhancedOptionsAnalyzer:
+    # ... (existing implementation) ...
+
     def _determine_primary_signal(self, score: float) -> str:
         """Determine primary trading signal based on score thresholds"""
         abs_score = abs(score)
@@ -982,6 +1201,105 @@ class EnhancedOptionsAnalyzer:
                 return 'STRONG_SELL'
             return 'SELL'
 
+    def calculate_risk_parameters(self, context: MarketContext, signals: Dict, instrument_info: Dict) -> Dict:
+        """Calculate risk parameters with focus on option positions"""
+        try:
+            # Get regime data safely
+            regime = self.regime_detector.detect_regime(context)
+            volatility_state = regime.get('volatility', {}).get('state', 'NORMAL') if regime else 'NORMAL'
+
+            # Get current prices - use option price for options
+            if instrument_info['type'] == 'option':
+                # Use option price for entry if available
+                if not context.option_history.empty:
+                    entry_price = float(context.option_history['close'].iloc[-1])
+                else:
+                    raise ValueError("Option data required for option analysis")
+            else:
+                # Use index price for stocks/indices
+                entry_price = context.index_price
+
+            combined_score = signals.get('combined_score', 0) if signals else 0
+
+            # For options specifically
+            if instrument_info['type'] == 'option':
+                # Determine position side based on option type and market view
+                is_bearish = combined_score < 0
+                is_put = instrument_info['option_type'] == 'put'
+
+                # Option-specific calculations
+                if (is_put and is_bearish) or (not is_put and not is_bearish):
+                    # Favorable setup
+                    if volatility_state == 'HIGH':
+                        sl_percentage = 0.40  # 40% for high volatility
+                    elif volatility_state == 'LOW':
+                        sl_percentage = 0.25  # 25% for low volatility
+                    else:
+                        sl_percentage = 0.30  # 30% for normal volatility
+
+                    stop_loss = round(entry_price * (1 - sl_percentage), 2)
+                    target = round(entry_price * (1 + (sl_percentage * self.risk_reward_ratio)), 2)
+
+                    return {
+                        'entry_price': entry_price,
+                        'stop_loss': stop_loss,
+                        'target': target,
+                        'action': 'BUY',
+                        'risk_reward_ratio': self.risk_reward_ratio,
+                        'risk_per_trade': round(entry_price - stop_loss, 2),
+                        'potential_reward': round(target - entry_price, 2),
+                        'price_source': 'option',
+                        'volatility_state': volatility_state,
+                        'option_details': {
+                            'strike': instrument_info['strike'],
+                            'days_to_expiry': instrument_info['days_to_expiry'],
+                            'type': instrument_info['option_type'],
+                            'spot_price': context.index_price
+                        }
+                    }
+                else:
+                    # Unfavorable setup
+                    return {
+                        'entry_price': entry_price,
+                        'action': 'DO_NOT_TRADE',
+                        'reason': f"{'Bullish' if is_bearish else 'Bearish'} signal mismatched with {instrument_info['option_type'].upper()} option",
+                        'price_source': 'option',
+                        'volatility_state': volatility_state,
+                        'option_details': {
+                            'strike': instrument_info['strike'],
+                            'days_to_expiry': instrument_info['days_to_expiry'],
+                            'type': instrument_info['option_type'],
+                            'spot_price': context.index_price
+                        }
+                    }
+            else:
+                # For index/stock analysis
+                sl_percentage = 0.03  # 3% for stocks
+                target_percentage = sl_percentage * 1.5  # 1.5 RR ratio
+
+                stop_loss = round(entry_price * (1 + sl_percentage), 2)
+                target = round(entry_price * (1 - target_percentage), 2)
+
+                return {
+                    'entry_price': entry_price,
+                    'stop_loss': stop_loss,
+                    'target': target,
+                    'action': 'SELL' if combined_score < 0 else 'BUY',
+                    'risk_reward_ratio': 1.5,
+                    'risk_per_trade': round(abs(stop_loss - entry_price), 2),
+                    'potential_reward': round(abs(target - entry_price), 2),
+                    'price_source': 'index/stock',
+                    'volatility_state': volatility_state
+                }
+
+        except Exception as e:
+            logger.error(f"Error calculating risk parameters: {str(e)}")
+            return {
+                'entry_price': entry_price if 'entry_price' in locals() else 0.0,
+                'action': 'ERROR',
+                'error': str(e),
+                'price_source': 'option' if instrument_info['type'] == 'option' else 'index/stock'
+            }
 
     def generate_recommendations(self, signals: Dict, risk_params: Dict) -> Dict:
         """Generate recommendations with option-specific focus"""
@@ -1137,214 +1455,104 @@ class OptionsRiskCalculator:
         }
 
 class OptionsGreeksAnalyzer:
-    """Enhanced options analysis with Greeks calculations"""
-
+    """Enhanced options Greeks analysis"""
+    
     def __init__(self):
         self.risk_free_rate = 0.05  # Can be updated with actual rates
-
+        
     def calculate_greeks(self,
-                        S: float,  # Spot price
+                        S: float,  # Current stock price
                         K: float,  # Strike price
-                        T: float,  # Time to expiration (in years)
+                        T: float,  # Time to expiry in years
                         r: float,  # Risk-free rate
                         sigma: float,  # Volatility
-                        option_type: str = 'call') -> Dict:
-        """Calculate option Greeks using Black-Scholes model"""
+                        option_type: str = 'call') -> Dict[str, float]:
+        """Calculate option Greeks"""
         try:
             # Calculate d1 and d2
             d1 = (np.log(S/K) + (r + sigma**2/2)*T) / (sigma*np.sqrt(T))
             d2 = d1 - sigma*np.sqrt(T)
-
+            
             # Adjust for put options
-            sign = 1 if option_type.lower() == 'call' else -1
-
+            multiplier = 1 if option_type.lower() == 'call' else -1
+            
             # Calculate Greeks
-            delta = sign * norm.cdf(sign * d1)
+            delta = multiplier * norm.cdf(multiplier * d1)
             gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
-            theta = (-S * sigma * norm.pdf(d1)) / (2 * np.sqrt(T)) - sign * r * K * np.exp(-r*T) * norm.cdf(sign * d2)
+            theta = (-S * sigma * norm.pdf(d1))/(2 * np.sqrt(T)) - \
+                    multiplier * r * K * np.exp(-r*T) * norm.cdf(multiplier * d2)
             vega = S * np.sqrt(T) * norm.pdf(d1)
-            rho = sign * K * T * np.exp(-r*T) * norm.cdf(sign * d2)
-
+            rho = multiplier * K * T * np.exp(-r*T) * norm.cdf(multiplier * d2)
+            
             return {
                 'delta': float(delta),
                 'gamma': float(gamma),
                 'theta': float(theta/365),  # Daily theta
-                'vega': float(vega/100),    # 1% volatility change
-                'rho': float(rho/100)       # 1% rate change
+                'vega': float(vega/100),    # For 1% vol change
+                'rho': float(rho/100)       # For 1% rate change
             }
-
+            
         except Exception as e:
             logger.error(f"Error calculating Greeks: {str(e)}")
-            return None
-
-    def analyze_implied_volatility(self,
-                                 option_chain: pd.DataFrame,
-                                 spot_price: float) -> Dict:
-        """Analyze volatility skew and term structure"""
-        try:
-            # Group by expiration
-            expirations = option_chain.groupby('expiration')
-
-            volatility_analysis = {
-                'skew': {},
-                'term_structure': {},
-                'average_iv': float(option_chain['implied_vol'].mean()),
-                'iv_range': {
-                    'min': float(option_chain['implied_vol'].min()),
-                    'max': float(option_chain['implied_vol'].max())
-                }
+            return {
+                'delta': 0.0,
+                'gamma': 0.0,
+                'theta': 0.0,
+                'vega': 0.0,
+                'rho': 0.0
             }
 
-            # Analyze volatility skew
-            for exp, group in expirations:
-                atm_strike = group.iloc[(group['strike'] - spot_price).abs().argsort()[:1]].index[0]
-                skew_data = group.sort_values('strike')
-
-                volatility_analysis['skew'][exp] = {
-                    'strikes': skew_data['strike'].tolist(),
-                    'implied_vols': skew_data['implied_vol'].tolist(),
-                    'atm_vol': float(group.loc[atm_strike, 'implied_vol'])
-                }
-
-            return volatility_analysis
-
-        except Exception as e:
-            logger.error(f"Error analyzing implied volatility: {str(e)}")
-            return None
-
 class EnhancedOIAnalyzer:
-    """Enhanced Open Interest analysis"""
-
+    """Enhanced Open Interest analyzer"""
+    
     def analyze_oi_patterns(self, oi_df: pd.DataFrame) -> Dict:
         """Analyze Open Interest patterns"""
         try:
             if len(oi_df) < 2:
                 return {'trend': 'INSUFFICIENT_DATA'}
 
-            # Create a copy of the DataFrame to avoid the SettingWithCopyWarning
+            # Create a copy of the DataFrame
             df = oi_df.copy()
             
-            # Calculate OI changes using loc
-            df.loc[:, 'oi_change'] = df['oi'].pct_change()
-            df.loc[:, 'oi_ma'] = TechnicalIndicators.calculate_sma(df['oi'], 5)
-
+            # Calculate OI changes
+            df['oi_change'] = df['oi'].pct_change()
+            df['oi_ma'] = TechnicalIndicators.calculate_sma(df['oi'], 5)
+            
             latest = df.iloc[-1]
-
+            
             # Detect OI trend
             oi_trend = 'INCREASING' if latest['oi'] > latest['oi_ma'] else 'DECREASING'
-
-            # Calculate buildup
-            price_up = latest['close'] > df['close'].iloc[-2] if 'close' in df.columns else None
-            oi_up = latest['oi'] > df['oi'].iloc[-2]
-
-            if price_up is not None:
-                buildup = 'LONG_BUILDUP' if price_up and oi_up else \
-                        'SHORT_BUILDUP' if not price_up and oi_up else \
-                        'LONG_UNWINDING' if not price_up and not oi_up else \
-                        'SHORT_COVERING'
-            else:
-                buildup = 'UNKNOWN'
-
+            
             return {
                 'trend': oi_trend,
-                'buildup': buildup,
+                'buildup': 'UNKNOWN',
                 'change_percentage': float(latest['oi_change'] * 100)
             }
-
+            
         except Exception as e:
             logger.error(f"Error analyzing OI patterns: {str(e)}")
-            return None
+            return {'trend': 'ERROR', 'error': str(e)}
 
-    def _analyze_historical_oi(self, historical_oi: pd.DataFrame) -> Dict:
-        """Analyze historical OI trends"""
-        try:
-            # Calculate daily changes
-            historical_oi['oi_change'] = historical_oi['open_interest'].diff()
+# Initialize Flask app
+app = Flask(__name__)
+CORS(app)
+compress = Compress()
+compress.init_app(app)
 
-            # Calculate trend metrics
-            recent_trend = historical_oi['oi_change'].tail(5).mean()
+# Initialize rate limiter
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"]
+)
 
-            trend_strength = abs(recent_trend) / historical_oi['open_interest'].mean()
-
-            return {
-                'trend': 'INCREASING' if recent_trend > 0 else 'DECREASING',
-                'strength': float(trend_strength),
-                'daily_changes': historical_oi['oi_change'].tail(5).tolist()
-            }
-
-        except Exception as e:
-            logger.error(f"Error analyzing historical OI: {str(e)}")
-            return None
-
-    def _calculate_put_call_ratio(self, option_chain: pd.DataFrame) -> float:
-        """Calculate Put/Call ratio"""
-        try:
-            puts_oi = option_chain[option_chain['option_type'] == 'put']['open_interest'].sum()
-            calls_oi = option_chain[option_chain['option_type'] == 'call']['open_interest'].sum()
-
-            return float(puts_oi / calls_oi) if calls_oi > 0 else 0
-
-        except Exception as e:
-            logger.error(f"Error calculating P/C ratio: {str(e)}")
-            return 0.0
-
-class OptionsDataValidator:
-    """Validator for options data"""
-
-    @staticmethod
-    def validate_timestamp(timestamp: str) -> bool:
-        """Validate timestamp format"""
-        try:
-            datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%S%z")
-            return True
-        except ValueError:
-            return False
-
-    @staticmethod
-    def validate_ohlcv(data: List[List]) -> bool:
-        """Validate OHLCV data format"""
-        if not data or not isinstance(data, list):
-            return False
-
-        for row in data:
-            if not isinstance(row, list) or len(row) != 6:
-                return False
-
-            # Validate timestamp
-            if not OptionsDataValidator.validate_timestamp(row[0]):
-                return False
-
-            # Validate numeric values
-            try:
-                all(float(x) >= 0 for x in row[1:])
-            except ValueError:
-                return False
-
-        return True
-
-    @staticmethod
-    def validate_oi_data(data: List[Dict]) -> bool:
-        """Validate OI data format"""
-        if not data or not isinstance(data, list):
-            return False
-
-        for entry in data:
-            if not isinstance(entry, dict):
-                return False
-
-            if 'time' not in entry or 'oi' not in entry:
-                return False
-
-            if not OptionsDataValidator.validate_timestamp(entry['time']):
-                return False
-
-            try:
-                float(entry['oi'])
-            except ValueError:
-                return False
-
-        return True
-
+@app.after_request
+def add_header(response):
+    """Add response headers"""
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response
 
 # Flask routes welcome message
 @app.route('/')
@@ -1356,8 +1564,9 @@ def welcome():
         "status": "active"
     })
 
-
 @app.route('/analyze', methods=['POST', 'OPTIONS'])
+@limiter.limit("10 per minute")
+@handle_analysis_error
 def analyze_instrument():
     # Handle CORS preflight requests
     if request.method == 'OPTIONS':
@@ -1444,86 +1653,6 @@ def analyze_instrument():
         response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
         response.headers['Content-Type'] = 'application/json'
         return response, 500
-        
-def calculate_option_returns(entry_price: float,
-                           exit_price: float,
-                           position_type: str = 'LONG') -> float:
-    """Calculate returns for an option trade"""
-    if position_type == 'LONG':
-        return (exit_price - entry_price) / entry_price * 100
-    else:  # SHORT
-        return (entry_price - exit_price) / entry_price * 100
-
-def calculate_position_size(account_size: float,
-                          risk_per_trade: float,
-                          entry_price: float,
-                          stop_loss: float) -> int:
-    """Calculate position size based on risk management"""
-    risk_amount = account_size * (risk_per_trade / 100)
-    per_unit_risk = abs(entry_price - stop_loss)
-
-    if per_unit_risk == 0:
-        return 0
-
-    position_size = risk_amount / per_unit_risk
-    return int(position_size)
-
-def calculate_risk_metrics(entry: float,
-                         stop_loss: float,
-                         target: float) -> Dict:
-    """Calculate risk metrics for a trade"""
-    risk = abs(entry - stop_loss)
-    reward = abs(target - entry)
-
-    return {
-        'risk_amount': risk,
-        'reward_amount': reward,
-        'risk_reward_ratio': reward / risk if risk != 0 else 0,
-        'risk_percentage': (risk / entry) * 100,
-        'reward_percentage': (reward / entry) * 100
-    }
-
-def format_signal_message(signal: str,
-                         entry: float,
-                         stop_loss: float,
-                         target: float,
-                         conditions: List[str]) -> str:
-    """Format trading signal message"""
-    return f"""
-    Signal: {signal}
-    Entry Price: {entry:.2f}
-    Stop Loss: {stop_loss:.2f} ({((stop_loss - entry) / entry * 100):.1f}%)
-    Target: {target:.2f} ({((target - entry) / entry * 100):.1f}%)
-    Conditions: {', '.join(conditions)}
-    """
-
-def main():
-    """Main function to run the server"""
-    try:
-        print("Starting server setup...")
-
-        # Setup ngrok tunnel
-        public_url = setup_server()
-
-        if public_url:
-            print(f"\nServer running at: {public_url}")
-            print("Use this URL to connect to the Options Analysis API")
-            print("\nAvailable endpoints:")
-            print("  POST /analyze - Analyze options data")
-            print("  GET / - Check API status")
-
-            # Start Flask app with specific host and port
-            app.run(host='0.0.0.0', port=5001, debug=True, use_reloader=False)
-        else:
-            print("Failed to establish ngrok tunnel")
-            print("Please check your ngrok authentication token and internet connection")
-
-    except Exception as e:
-        logger.error(f"Startup error: {str(e)}")
-        try:
-            ngrok.kill()
-        except:
-            pass
 
 if __name__ == '__main__':
     try:

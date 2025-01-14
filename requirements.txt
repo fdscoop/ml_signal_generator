@@ -4,3 +4,7 @@ numpy
 pandas
 scipy
 gunicorn
+flask-limiter
+flask-compress
+scikit-learn
+structlog
